@@ -1,0 +1,13 @@
+# API keys (gen3d.py also reads $GEN3D_ENV_FILE and ~/.config/gen3d/env)
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Godot generates uid companions for extras/godot/*.gd when this repo is
+# vendored inside a Godot project (e.g. as a git submodule)
+*.uid
+
+# OS
+.DS_Store

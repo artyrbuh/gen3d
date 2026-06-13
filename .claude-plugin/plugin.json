@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "gen3d",
+  "displayName": "gen3d image→3D pipeline",
+  "version": "0.1.0",
+  "description": "Pay-per-use image→3D asset pipeline (fal.ai Hunyuan3D / Tripo): generate GLBs from concept images, then rig and retarget preset animations — with a mandatory geometry-audit workflow and an explicit spend-approval contract.",
+  "author": {
+    "name": "Alexander Artlett",
+    "email": "artie1991@gmail.com"
+  },
+  "homepage": "https://github.com/artyrbuh/gen3d",
+  "repository": "https://github.com/artyrbuh/gen3d",
+  "license": "MIT",
+  "keywords": ["3d", "tripo", "fal", "hunyuan3d", "glb", "image-to-3d", "animation", "godot"]
+}
