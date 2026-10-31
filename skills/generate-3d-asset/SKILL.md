@@ -17,9 +17,10 @@ It is stdlib-only Python 3 — no pip install, no venv.
 ## Spend contract (non-negotiable)
 
 `generate`, `rig`, and `animate` spend the user's money. **State the estimated
-cost and get the user's explicit approval before every paid run.** The CLI
-refuses to spend non-interactively without `--yes`; only pass `--yes` after the
-user approved that specific spend — never on your own initiative.
+cost and get the user's explicit approval before every paid run.** `rig` and
+`animate` refuse to spend non-interactively without `--yes`; only pass `--yes`
+after the user approved that specific spend — never on your own initiative.
+`generate` has no such check and spends as soon as it runs.
 `balance`, `import-model`, `check`, and `--help` are free.
 
 ## Inputs to collect (ask if missing)
@@ -45,8 +46,8 @@ python3 <path>/gen3d.py --image <concept.png> --out <name>.glb [--json]
 
 - Default backend is fal.ai Hunyuan3D (~$0.05 plain, ~3× textured).
   Alternatives: `--model tripo` (Tripo v2.5 via the same FAL_KEY, ~$0.20–0.40,
-  honors `--max-faces`) or `--backend tripo` (native Tripo API, TRIPO_API_KEY,
-  20–40 credits ≈ $0.20–0.40).
+  honors `--max-faces`) or `--backend tripo` (native Tripo API V3, TRIPO_API_KEY,
+  `v3.1-20260211`, 30 credits = $0.30 textured, 20 credits with `--no-texture`).
 - `--max-faces 20000` is the default poly budget (mobile-friendly). Hunyuan
   ignores it; prefer a Tripo model when the budget is strict.
 - Keys come from the environment, `$GEN3D_ENV_FILE`, a script-adjacent `.env`,
@@ -86,15 +87,20 @@ user how they want it wired. Don't place assets into scenes uninvited.
 
 ```bash
 python3 <path>/gen3d.py import-model --model hero.glb        # FREE → import task id
-python3 <path>/gen3d.py check --task-id <import-id>          # FREE → riggable? rig_type?
-python3 <path>/gen3d.py rig --task-id <import-id> --out rigged.glb        # 25 cr ≈ $0.25
+python3 <path>/gen3d.py check --task-id <id>                 # FREE → riggable? rig_type?
+python3 <path>/gen3d.py rig --task-id <id> --rig-type <rig_type> --out rigged.glb  # 25 cr = $0.25
 python3 <path>/gen3d.py animate --rig-task-id <rig-id> --presets run,jump \
-    --out anim.glb                                           # 10 cr ≈ $0.10 per preset
+    --out anim.glb                                           # 10 cr = $0.10 per preset
 ```
 
+- A model generated with `--backend tripo` can skip the import: pass its task id
+  to `check` and `rig`. `--task-id` also takes a file token or URL.
+- Pass the `rig_type` that `check` recommends; the CLI defaults to `biped`.
+- `--rig-version` defaults to `v2.5-20260210`, for non-humanoids. Tripo
+  recommends `v3.0-20260909` for humanoids.
 - Presets: idle, walk, run, dive, climb, jump, slash, shoot, hurt, fall, turn,
   plus quadruped/hexapod/octopod walk and serpentine/aquatic march. Max 5 per
-  task.
+  task. A `v1.0-20240301` rig uses `biped:<name>` presets instead.
 - Audit animated output too: re-probe with animation sampling (Godot:
   `render_probe.gd --anim`) and check for skinning smears (capes/loose
   geometry are the usual casualties) BEFORE building anything on the clips.
@@ -106,6 +112,6 @@ python3 <path>/gen3d.py animate --rig-task-id <rig-id> --presets run,jump \
 |---|---|---|
 | fal + Hunyuan3D (default) | ~$0.05–0.48 | no face-limit param |
 | fal + Tripo v2.5 | ~$0.20–0.40 | honors face_limit, same FAL_KEY |
-| native Tripo API | 20–40 credits (~$0.20–0.40) | TRIPO_API_KEY; $1 ≈ 100 credits |
-| rig | 25 credits (~$0.25) | requires import task id |
-| animate | 10 credits (~$0.10) per preset | max 5 per task |
+| native Tripo API V3 | 30 credits ($0.30) textured, 20 untextured | TRIPO_API_KEY; $1 = 100 credits |
+| rig | 25 credits ($0.25) | takes a generation or import task id, file token, or URL |
+| animate | 10 credits ($0.10) per preset | max 5 per task |
