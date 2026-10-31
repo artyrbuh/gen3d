@@ -4,7 +4,7 @@
 Subcommands (default `generate` — bare `--image/--out` invocations still work):
 
   generate      image -> 3D GLB (fal.ai Hunyuan/Tripo, or native Tripo API)
-  import-model  upload an existing GLB/OBJ/FBX/STL to Tripo -> task id (FREE)
+  import-model  upload an existing GLB/OBJ/FBX/STL to Tripo -> task id + file token (FREE)
   check         pre-rig check on a task id -> riggable verdict (FREE)
   rig           rig a model for animation (25 credits ~= $0.25)
   animate       retarget preset animations onto a rigged model (10 credits each)
@@ -15,11 +15,11 @@ Generation backends (design notes: docs/pipeline-design.md):
   fal    fal.ai queue API, one FAL_KEY, two selectable models:
            --model hunyuan  fal-ai/hunyuan3d/v2          (~$0.05 plain, ~3x textured)
            --model tripo    tripo3d/tripo/v2.5/image-to-3d (Tripo's model, same key)
-  tripo  Tripo's native developer API (api.tripo3d.ai), TRIPO_API_KEY,
-         credits ~= $0.01 each, a generation ~= 20-40 credits.
+  tripo  Tripo's native developer API V3 (openapi.tripo3d.ai/v3), TRIPO_API_KEY,
+         credits = $0.01 each, image -> 3D = 30 credits textured, 20 untextured.
 
 The animation chain (docs/animation-chain.md):
-  import-model --model hero.glb     -> import task id        (free)
+  import-model --model hero.glb     -> import task id + file token (free)
   check --task-id <import-id>       -> riggable? rig_type?   (free)
   rig --task-id <import-id> --out rigged.glb                 (25 cr)
   animate --rig-task-id <rig-id> --presets run,jump --out anim.glb  (10 cr/preset)
@@ -38,14 +38,11 @@ Examples:
 
 import argparse
 import base64
-import hashlib
-import hmac
 import json
 import os
 import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 
@@ -63,22 +60,31 @@ FAL_MODELS = {
     "hunyuan": "fal-ai/hunyuan3d/v2",
     "tripo": "tripo3d/tripo/v2.5/image-to-3d",
 }
-TRIPO_API = "https://api.tripo3d.ai/v2/openapi"
+TRIPO_API = "https://openapi.tripo3d.ai/v3"
+# V3 requires a model on every generation; this is the one its docs recommend.
+TRIPO_GEN_MODEL = "v3.1-20260211"
 
 POLL_INTERVAL_S = 5
-MAX_IMAGE_BYTES = 20 * 1024 * 1024  # both providers cap uploads at 20 MB
-MAX_MODEL_BYTES = 20 * 1024 * 1024  # STS upload cap
+TRIPO_POLL_INTERVAL_S = 2  # the V3 docs ask for one poll every 1-2 s
+TRIPO_GET_RETRIES = 5
+TRIPO_RETRY_CAP_S = 32
+MAX_IMAGE_BYTES = 20 * 1024 * 1024  # both providers cap images at 20 MB
+MAX_MODEL_BYTES = 150 * 1024 * 1024  # Tripo V3 model input cap
 
 MIME_BY_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                ".webp": "image/webp"}
 MODEL_FORMAT_BY_EXT = {".glb": "glb", ".obj": "obj", ".fbx": "fbx", ".stl": "stl"}
 
-# Tripo retarget preset library (verified 2026-06-13, docs.tripo3d.ai animation/retarget)
+# Tripo retarget presets for v2.5-20260210 / v3.0-20260909 rigs (verified 2026-10-31,
+# developers.tripo3d.ai/en/docs/animations-retarget). v1.0-20240301 rigs document
+# their own 90+ names as biped:<name>; those pass through for the API to validate.
 PRESETS = ["idle", "walk", "run", "dive", "climb", "jump", "slash", "shoot",
            "hurt", "fall", "turn", "quadruped:walk", "hexapod:walk",
            "octopod:walk", "serpentine:march", "aquatic:march"]
 RETARGET_CREDITS_PER_ANIM = 10
 RIG_CREDITS = 25
+TEXTURED_CREDITS = 30
+UNTEXTURED_CREDITS = 20
 
 KEY_HELP = {
     "FAL_KEY": "https://fal.ai/dashboard/keys",
@@ -155,7 +161,7 @@ def http_json(url, headers, body=None, method=None):
         fail(f"network error reaching {url}: {e.reason}")
 
 
-def download(url, out_path, headers=None):
+def download(url, out_path, headers=None, context=""):
     tmp = out_path + ".part"
     req = urllib.request.Request(url, headers=headers or {})
     try:
@@ -168,7 +174,7 @@ def download(url, out_path, headers=None):
     except (urllib.error.URLError, OSError) as e:
         if os.path.exists(tmp):
             os.remove(tmp)
-        fail(f"download failed: {e}")
+        fail(f"download failed{context}: {e}")
     os.replace(tmp, out_path)
     size = os.path.getsize(out_path)
     say(f"wrote {out_path} ({size / 1e6:.1f} MB)")
@@ -235,68 +241,142 @@ def tripo_headers():
     return {"Authorization": f"Bearer {require_key('TRIPO_API_KEY')}"}
 
 
-def tripo_upload(headers, image_data, mime, path):
-    boundary = uuid.uuid4().hex
-    name = os.path.basename(path)
-    body = (f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="file"; filename="{name}"\r\n'
-            f"Content-Type: {mime}\r\n\r\n").encode() + image_data + \
-           f"\r\n--{boundary}--\r\n".encode()
-    req = urllib.request.Request(
-        f"{TRIPO_API}/upload", data=body,
-        headers={**headers, "Content-Type": f"multipart/form-data; boundary={boundary}"})
+def tripo_error(where, raw, status=None):
+    """Readable text for a V3 error envelope, or the raw body if it isn't one."""
+    prefix = f"HTTP {status} from {where}" if status else f"error from {where}"
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            out = json.loads(resp.read().decode())
+        body = json.loads(raw)
+    except ValueError:
+        return f"{prefix}\n{raw.decode(errors='replace')[:1000]}"
+    if not isinstance(body, dict):
+        return f"{prefix}\n{raw.decode(errors='replace')[:1000]}"
+    parts = [f"code {body.get('code')}: {body.get('message')}"]
+    if body.get("suggestion"):
+        parts.append(body["suggestion"])
+    if body.get("request_id"):
+        parts.append(f"request_id {body['request_id']}")
+    return f"{prefix}\n" + " | ".join(parts)
+
+
+def tripo_retry_wait(error, attempt):
+    """Seconds to wait before retrying a GET: Retry-After if given, else 1, 2, 4..."""
+    header = error.headers.get("Retry-After") if error is not None else None
+    if header and header.isdigit():
+        return min(int(header), TRIPO_RETRY_CAP_S)
+    return min(2 ** attempt, TRIPO_RETRY_CAP_S)
+
+
+def tripo_api(headers, path, body=None):
+    """One V3 call; returns the `data` object. GETs are safe to retry, so they ride
+    out 429/5xx/network errors. A POST is sent once: per the docs a create may have
+    succeeded even if its response was lost, and a retry could pay twice."""
+    url = f"{TRIPO_API}{path}"
+    is_post = body is not None
+    attempts = 1 if is_post else TRIPO_GET_RETRIES + 1
+    data = json.dumps(body).encode() if is_post else None
+    req_headers = {**headers, **({"Content-Type": "application/json"} if is_post else {})}
+    for attempt in range(attempts):
+        last_try = attempt == attempts - 1
+        req = urllib.request.Request(url, data=data, headers=req_headers,
+                                     method="POST" if is_post else "GET")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            if last_try or not (e.code == 429 or e.code >= 500):
+                fail(tripo_error(path, raw, e.code))
+            wait = tripo_retry_wait(e, attempt)
+            say(f"  HTTP {e.code} from {path}, retrying in {wait}s")
+            time.sleep(wait)
+            continue
+        except OSError as e:
+            if is_post:
+                fail(f"network error during POST {path}: {e}. The request may have been "
+                     "created; check the balance and usage before resubmitting.")
+            if last_try:
+                fail(f"network error reaching {path}: {e}")
+            wait = tripo_retry_wait(None, attempt)
+            say(f"  network error on {path}, retrying in {wait}s")
+            time.sleep(wait)
+            continue
+        try:
+            out = json.loads(raw)
+        except ValueError:
+            fail(tripo_error(path, raw))
+        if not isinstance(out, dict) or out.get("code") != 0:
+            fail(tripo_error(path, raw))
+        return out.get("data") or {}
+
+
+def tripo_upload(headers, data, fmt):
+    """Presign, then PUT straight to storage. Returns the file token for `input`.
+    Presign covers every format and size the CLI takes (/v3/files lacks WebP)."""
+    d = tripo_api(headers, "/files/presign", {"format": fmt})
+    url, token = d.get("presigned_url"), d.get("file_token")
+    if not (url and token):
+        fail(f"presign response missing presigned_url/file_token: {sorted(d)}")
+    # no auth header: the URL is already signed and goes to third-party storage
+    req = urllib.request.Request(url, data=data, method="PUT",
+                                 headers={"Content-Type": "application/octet-stream"})
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            resp.read()
     except urllib.error.HTTPError as e:
-        fail(f"HTTP {e.code} from upload\n{e.read().decode(errors='replace')}")
-    except urllib.error.URLError as e:
-        fail(f"network error during upload: {e.reason}")
-    token = (out.get("data") or {}).get("image_token")
-    if not token:
-        fail(f"no image_token in upload response: {json.dumps(out)[:500]}")
+        fail(f"upload to storage failed: HTTP {e.code}\n"
+             f"{e.read().decode(errors='replace')[:1000]}")
+    except OSError as e:
+        fail(f"network error during upload to storage: {e}")
     return token
 
 
-def tripo_create_task(headers, body):
-    sub = http_json(f"{TRIPO_API}/task", headers, body)
-    task_id = (sub.get("data") or {}).get("task_id")
+def tripo_create_task(headers, path, body):
+    task_id = tripo_api(headers, path, body).get("task_id")
     if not task_id:
-        fail(f"no task_id in response: {json.dumps(sub)[:500]}")
-    say(f"task {task_id} queued ({body['type']})")
+        fail(f"no task_id in response from {path}")
+    say(f"task {task_id} queued ({path})")
     return task_id
 
 
 def tripo_wait_task(headers, task_id, timeout):
     deadline = time.time() + timeout
     last = None
-    while time.time() < deadline:
-        st = http_json(f"{TRIPO_API}/task/{task_id}", headers)
-        data = st.get("data") or {}
+    while True:
+        data = tripo_api(headers, f"/tasks/{task_id}")
         status = data.get("status")
         if status != last:
             say(f"  status: {status}")
             last = status
         if status == "success":
             return data
-        if status in ("failed", "banned", "expired", "cancelled", "unknown"):
+        # any other value, `unknown` included, is not final per the V3 docs
+        if status in ("failed", "cancelled", "banned", "expired"):
             fail(f"tripo task ended '{status}': {json.dumps(data)[:1000]}")
-        time.sleep(POLL_INTERVAL_S)
-    fail(f"timed out after {timeout}s waiting on tripo task {task_id}")
+        if time.time() >= deadline:
+            fail(f"timed out after {timeout}s waiting on tripo task {task_id} "
+                 f"(last status: {status})")
+        time.sleep(TRIPO_POLL_INTERVAL_S)
 
 
 def tripo_download_model(data, out_path):
+    task_id = data.get("task_id")
     output = data.get("output") or {}
-    url = output.get("pbr_model") or output.get("model") or output.get("base_model")
+    url = output.get("model_url")
     if not url:
-        fail(f"no model url in output: {json.dumps(output)[:500]}")
-    # download links expire ~5 minutes after success — grab it now
-    return download(url, out_path)
+        fail(f"tripo task {task_id} succeeded but output has no model_url: "
+             f"{json.dumps(output)[:500]}")
+    # V3 doesn't document the link's lifetime (measured: 24 h) — grab it now
+    return download(url, out_path, context=f" for tripo task {task_id}")
+
+
+def tripo_credits(data, estimate):
+    """What the task really cost, falling back to the published price."""
+    spent = data.get("credits_consumed")
+    return estimate if spent is None else spent
 
 
 def tripo_balance(headers):
-    out = http_json(f"{TRIPO_API}/user/balance", headers)
-    return out.get("data") or {}
+    return tripo_api(headers, "/account/balance")
 
 
 def confirm_spend(headers, credits, what, assume_yes):
@@ -313,130 +393,67 @@ def confirm_spend(headers, credits, what, assume_yes):
         fail("aborted by user")
 
 
-def run_tripo(args, image_data, mime, image_ext):
+def run_tripo(args, image_data, image_ext):
     headers = tripo_headers()
+    estimate = TEXTURED_CREDITS if args.texture else UNTEXTURED_CREDITS
 
     say("uploading image to tripo...")
-    token = tripo_upload(headers, image_data, mime, args.image)
+    token = tripo_upload(headers, image_data, image_ext)
 
-    body = {"type": "image_to_model",
-            "file": {"type": image_ext, "file_token": token},
+    body = {"input": token,
+            "model": TRIPO_GEN_MODEL,
             "texture": args.texture,
             "pbr": args.texture}
     if args.max_faces:
         body["face_limit"] = args.max_faces
-    say("submitting image_to_model task (cost ~20-40 credits ~= $0.20-0.40)")
-    task_id = tripo_create_task(headers, body)
+    say(f"submitting image-to-model on {TRIPO_GEN_MODEL} "
+        f"(cost ~{estimate} credits ~= ${estimate / 100:.2f})")
+    task_id = tripo_create_task(headers, "/generation/image-to-model", body)
     data = tripo_wait_task(headers, task_id, args.timeout)
     _, size = tripo_download_model(data, args.out)
     return {"task_id": task_id, "output": args.out, "output_bytes": size,
+            "credits_spent": tripo_credits(data, estimate),
             "balance": tripo_balance(headers)}
 
 
-# ----------------------------------------------------- STS upload (model files)
+# ------------------------------------------------------- animation subcommands
 
-def _hmac_sha256(key, msg):
-    return hmac.new(key, msg.encode(), hashlib.sha256).digest()
-
-
-def s3_put_sigv4(host, bucket, key, data, access_key, secret_key, session_token):
-    """Minimal AWS SigV4 signer for a single path-style S3 PUT (stdlib only)."""
-    # host is like s3.us-west-2.amazonaws.com — region is the second label
-    parts = host.split(".")
-    region = parts[1] if len(parts) > 3 and parts[0].startswith("s3") else "us-west-2"
-
-    uri = "/" + urllib.parse.quote(f"{bucket}/{key}", safe="/-._~")
-    payload_hash = hashlib.sha256(data).hexdigest()
-    now = time.gmtime()
-    amz_date = time.strftime("%Y%m%dT%H%M%SZ", now)
-    datestamp = time.strftime("%Y%m%d", now)
-
-    sign_headers = {
-        "host": host,
-        "x-amz-content-sha256": payload_hash,
-        "x-amz-date": amz_date,
-        "x-amz-security-token": session_token,
-    }
-    signed_list = ";".join(sorted(sign_headers))
-    canonical_headers = "".join(f"{k}:{sign_headers[k]}\n" for k in sorted(sign_headers))
-    canonical_request = "\n".join(
-        ["PUT", uri, "", canonical_headers, signed_list, payload_hash])
-    scope = f"{datestamp}/{region}/s3/aws4_request"
-    string_to_sign = "\n".join(
-        ["AWS4-HMAC-SHA256", amz_date, scope,
-         hashlib.sha256(canonical_request.encode()).hexdigest()])
-    k = _hmac_sha256(("AWS4" + secret_key).encode(), datestamp)
-    for part in (region, "s3", "aws4_request"):
-        k = _hmac_sha256(k, part)
-    signature = hmac.new(k, string_to_sign.encode(), hashlib.sha256).hexdigest()
-
-    req = urllib.request.Request(
-        f"https://{host}{uri}", data=data, method="PUT",
-        headers={
-            "Authorization": (f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
-                              f"SignedHeaders={signed_list}, Signature={signature}"),
-            "x-amz-date": amz_date,
-            "x-amz-content-sha256": payload_hash,
-            "x-amz-security-token": session_token,
-        })
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            resp.read()
-    except urllib.error.HTTPError as e:
-        fail(f"S3 PUT failed HTTP {e.code}\n{e.read().decode(errors='replace')[:1000]}")
-    except urllib.error.URLError as e:
-        fail(f"network error during S3 PUT: {e.reason}")
-
-
-def sts_upload_model(headers, path):
-    """Upload a model file via Tripo's STS flow; returns the task `file` dict."""
+def read_model(path):
     ext = os.path.splitext(path)[1].lower()
     fmt = MODEL_FORMAT_BY_EXT.get(ext)
     if not fmt:
         fail(f"unsupported model type '{ext}' — use glb/obj/fbx/stl")
     try:
+        if os.path.getsize(path) > MAX_MODEL_BYTES:
+            fail(f"model is {os.path.getsize(path) / 1e6:.1f} MB — "
+                 f"Tripo limit is {MAX_MODEL_BYTES // (1024 * 1024)} MB")
         with open(path, "rb") as f:
-            data = f.read()
+            return f.read(), fmt
     except OSError as e:
         fail(f"cannot read model: {e}")
-    if len(data) > MAX_MODEL_BYTES:
-        fail(f"model is {len(data) / 1e6:.1f} MB — STS upload limit is 20 MB")
 
-    say(f"requesting STS upload token ({fmt}, {len(data) / 1e6:.1f} MB)...")
-    tok = http_json(f"{TRIPO_API}/upload/sts/token", headers, {"format": fmt})
-    d = tok.get("data") or {}
-    missing = [k for k in ("sts_ak", "sts_sk", "session_token",
-                           "resource_bucket", "resource_uri") if not d.get(k)]
-    if missing:
-        fail(f"STS token response missing {missing}: {json.dumps(tok)[:500]}")
-    host = d.get("s3_host") or "s3.us-west-2.amazonaws.com"
-
-    say(f"uploading to s3://{d['resource_bucket']}/{d['resource_uri']} ...")
-    s3_put_sigv4(host, d["resource_bucket"], d["resource_uri"], data,
-                 d["sts_ak"], d["sts_sk"], d["session_token"])
-    return {"type": fmt,
-            "object": {"bucket": d["resource_bucket"], "key": d["resource_uri"]}}
-
-
-# ------------------------------------------------------- animation subcommands
 
 def cmd_import_model(args):
+    data, fmt = read_model(args.model)
     headers = tripo_headers()
-    file_spec = sts_upload_model(headers, args.model)
-    say("submitting import_model task (FREE)")
-    task_id = tripo_create_task(headers, {"type": "import_model", "file": file_spec})
-    tripo_wait_task(headers, task_id, args.timeout)
+    say(f"uploading {fmt} ({len(data) / 1e6:.1f} MB)...")
+    token = tripo_upload(headers, data, fmt)
+    say("submitting import task (FREE)")
+    task_id = tripo_create_task(headers, "/models/import", {"input": token})
+    output = tripo_wait_task(headers, task_id, args.timeout).get("output") or {}
     say(f"\nimport task id: {task_id}")
+    say(f"file token: {token}")
     say(f"next: python3 {SELF} check --task-id {task_id}")
-    return {"ok": True, "command": "import-model", "task_id": task_id}
+    return {"ok": True, "command": "import-model", "task_id": task_id,
+            "file_token": token,
+            "normalize_scale": output.get("normalize_scale"),
+            "normalize_translation": output.get("normalize_translation")}
 
 
 def cmd_check(args):
     headers = tripo_headers()
-    say("submitting animate_prerigcheck task (FREE)")
-    task_id = tripo_create_task(
-        headers, {"type": "animate_prerigcheck",
-                  "original_model_task_id": args.task_id})
+    say("submitting rig check (FREE)")
+    task_id = tripo_create_task(headers, "/animations/rig-check", {"input": args.task_id})
     data = tripo_wait_task(headers, task_id, args.timeout)
     output = data.get("output") or {}
     say(f"\nriggable: {output.get('riggable')}")
@@ -454,16 +471,15 @@ def cmd_check(args):
 def cmd_rig(args):
     headers = tripo_headers()
     if args.spec == "mixamo":
-        say("warning: spec=mixamo skeletons CANNOT be retargeted by Tripo — "
-            "only use this for an external Mixamo workflow")
-    confirm_spend(headers, RIG_CREDITS, f"animate_rig ({args.rig_version})", args.yes)
-    body = {"type": "animate_rig",
-            "original_model_task_id": args.task_id,
-            "model_version": args.rig_version,
+        say("warning: spec=mixamo skeletons could not be retargeted by Tripo on API V2 "
+            "(unverified on V3) — only use this for an external Mixamo workflow")
+    confirm_spend(headers, RIG_CREDITS, f"auto rig ({args.rig_version})", args.yes)
+    body = {"input": args.task_id,
+            "model": args.rig_version,
             "out_format": args.out_format,
             "rig_type": args.rig_type,
             "spec": args.spec}
-    task_id = tripo_create_task(headers, body)
+    task_id = tripo_create_task(headers, "/animations/rig", body)
     data = tripo_wait_task(headers, task_id, args.timeout)
     _, size = tripo_download_model(data, args.out)
     balance = tripo_balance(headers)
@@ -473,25 +489,24 @@ def cmd_rig(args):
         f"animate --rig-task-id {task_id} --presets run --out <anim.glb>")
     return {"ok": True, "command": "rig", "rig_task_id": task_id,
             "source_task_id": args.task_id, "output": args.out,
-            "output_bytes": size, "credits_spent": RIG_CREDITS,
+            "output_bytes": size, "credits_spent": tripo_credits(data, RIG_CREDITS),
             "balance": balance}
 
 
 def cmd_animate(args):
     headers = tripo_headers()
     presets = [p.strip().lower() for p in args.presets.split(",") if p.strip()]
-    bad = [p for p in presets if p not in PRESETS]
+    bad = [p for p in presets if p not in PRESETS and not p.startswith("biped:")]
     if bad:
-        fail(f"unknown preset(s) {bad} — available: {', '.join(PRESETS)}")
+        fail(f"unknown preset(s) {bad} — available: {', '.join(PRESETS)}, "
+             "or biped:<name> on a v1.0-20240301 rig")
     if len(presets) > 5:
         fail("at most 5 animations per retarget task")
     credits = RETARGET_CREDITS_PER_ANIM * len(presets)
     confirm_spend(headers, credits,
-                  f"animate_retarget ({', '.join(presets)})", args.yes)
-    body = {"type": "animate_retarget",
-            "original_model_task_id": args.rig_task_id,
+                  f"retarget ({', '.join(presets)})", args.yes)
+    body = {"input": args.rig_task_id,
             "out_format": args.out_format,
-            "bake_animation": True,
             "export_with_geometry": True}
     qualified = [f"preset:{p}" for p in presets]
     if len(qualified) == 1:
@@ -500,7 +515,7 @@ def cmd_animate(args):
         body["animations"] = qualified
     if args.in_place:
         body["animate_in_place"] = True
-    task_id = tripo_create_task(headers, body)
+    task_id = tripo_create_task(headers, "/animations/retarget", body)
     data = tripo_wait_task(headers, task_id, args.timeout)
     _, size = tripo_download_model(data, args.out)
     balance = tripo_balance(headers)
@@ -510,7 +525,7 @@ def cmd_animate(args):
     return {"ok": True, "command": "animate", "task_id": task_id,
             "rig_task_id": args.rig_task_id, "presets": presets,
             "output": args.out, "output_bytes": size,
-            "credits_spent": credits, "balance": balance}
+            "credits_spent": tripo_credits(data, credits), "balance": balance}
 
 
 def cmd_balance(_args):
@@ -531,7 +546,7 @@ def cmd_generate(args):
     if args.backend == "fal":
         result = run_fal(args, image_data, mime)
     else:
-        result = run_tripo(args, image_data, mime, image_ext)
+        result = run_tripo(args, image_data, image_ext)
 
     say("done. next: audit the mesh from all angles before using it — see the "
         "generate-3d-asset skill (Godot: extras/godot/render_probe.gd)")
@@ -561,7 +576,7 @@ def main():
     gen.add_argument("--image", required=True, help="concept image (png/jpg/webp, <=20 MB)")
     gen.add_argument("--out", required=True, help="output GLB path, e.g. assets/models/foo.glb")
     gen.add_argument("--backend", choices=["fal", "tripo"], default="fal",
-                     help="fal = fal.ai queue (default); tripo = native Tripo developer API")
+                     help="fal = fal.ai queue (default); tripo = native Tripo developer API V3")
     gen.add_argument("--model", choices=["hunyuan", "tripo"], default="hunyuan",
                      help="fal backend only: hunyuan3d/v2 (default) or Tripo v2.5 on fal")
     gen.add_argument("--texture", action=argparse.BooleanOptionalAction, default=True,
@@ -573,32 +588,35 @@ def main():
     gen.set_defaults(func=cmd_generate)
 
     imp = sub.add_parser("import-model",
-                         help="upload a GLB/OBJ/FBX/STL to Tripo -> task id (FREE)")
-    imp.add_argument("--model", required=True, help="model file (<=20 MB)")
+                         help="upload a GLB/OBJ/FBX/STL to Tripo -> task id + file token (FREE)")
+    imp.add_argument("--model", required=True, help="model file (<=150 MB)")
     add_timeout(imp, 300)
     add_json(imp)
     imp.set_defaults(func=cmd_import_model)
 
     chk = sub.add_parser("check", help="pre-rig check: is this model riggable? (FREE)")
     chk.add_argument("--task-id", required=True,
-                     help="task id of the model (e.g. from import-model)")
+                     help="model to check: a generation task id, file token or URL")
     add_timeout(chk, 300)
     add_json(chk)
     chk.set_defaults(func=cmd_check)
 
     rig = sub.add_parser("rig", help=f"rig a model for animation ({RIG_CREDITS} credits)")
     rig.add_argument("--task-id", required=True,
-                     help="task id of the model to rig (e.g. from import-model)")
+                     help="model to rig: a generation task id, file token or URL")
     rig.add_argument("--out", required=True, help="output path for the rigged model")
     rig.add_argument("--out-format", choices=["glb", "fbx"], default="glb")
     rig.add_argument("--rig-type", default="biped",
                      choices=["biped", "quadruped", "hexapod", "octopod", "avian",
                               "serpentine", "aquatic", "others"])
-    rig.add_argument("--spec", choices=["tripo", "mixamo"], default="tripo",
-                     help="tripo (default; required for Tripo retargeting) or mixamo")
+    rig.add_argument("--spec", default="tripo",
+                     choices=["tripo", "mixamo", "actorcore", "unity", "unreal", "vrm"],
+                     help="skeleton convention, bipeds only (default tripo, the safe choice "
+                          "for Tripo retargeting; actorcore/unity/unreal/vrm need v3.0)")
     rig.add_argument("--rig-version", default="v2.5-20260210",
-                     choices=["v2.5-20260210", "v1.0-20240301"],
-                     help="rig model version (fall back to v1.0 if v2.5 rejects the source)")
+                     choices=["v2.5-20260210", "v3.0-20260909", "v1.0-20240301"],
+                     help="v2.5 (default) for non-humanoids; Tripo recommends v3.0 for "
+                          "humanoids; v1.0 is biped-only with its own biped:<name> presets")
     rig.add_argument("--yes", action="store_true", help="skip the cost confirmation")
     add_timeout(rig)
     add_json(rig)
@@ -609,7 +627,8 @@ def main():
                               f"({RETARGET_CREDITS_PER_ANIM} credits each, max 5)")
     ani.add_argument("--rig-task-id", required=True, help="task id of the RIG task")
     ani.add_argument("--presets", required=True,
-                     help=f"comma list from: {', '.join(PRESETS)}")
+                     help=f"comma list from: {', '.join(PRESETS)}, or biped:<name> "
+                          "on a v1.0 rig")
     ani.add_argument("--out", required=True, help="output path for the animated model")
     ani.add_argument("--out-format", choices=["glb", "fbx"], default="glb")
     ani.add_argument("--in-place", action="store_true",

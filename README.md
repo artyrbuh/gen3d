@@ -8,15 +8,15 @@ spend.
 
 ```
 generate      image → 3D GLB                    ~$0.05–0.40
-import-model  upload an existing GLB → task id  FREE
+import-model  upload an existing GLB → task id  FREE (measured)
 check         pre-rig check → riggable verdict  FREE
 rig           rig a model for animation         25 credits ≈ $0.25
 animate       retarget preset animations        10 credits ≈ $0.10 each
 balance       remaining Tripo API credits       FREE
 ```
 
-No pip install — Python 3 stdlib only (including a hand-rolled SigV4 S3 PUT
-for Tripo's STS upload).
+No pip install — Python 3 stdlib only. Native Tripo calls use API V3
+(`https://openapi.tripo3d.ai/v3`).
 
 ## Install
 
@@ -47,7 +47,7 @@ keys in `~/.config/gen3d/env`, not next to the script.
 | Variable | Backend | Get one at |
 |---|---|---|
 | `FAL_KEY` | fal.ai (Hunyuan3D + Tripo v2.5) | https://fal.ai/dashboard/keys |
-| `TRIPO_API_KEY` | native Tripo API + all rig/animate commands | https://platform.tripo3d.ai |
+| `TRIPO_API_KEY` | native Tripo API V3 + all rig/animate commands | https://platform.tripo3d.ai |
 
 Lookup order: process environment → `$GEN3D_ENV_FILE` → `.env` next to
 `gen3d.py` → `~/.config/gen3d/env` (all `KEY=value` lines; `.env` is
@@ -66,15 +66,19 @@ python3 gen3d.py animate --rig-task-id <rig-id> --presets run,jump --out anim.gl
 python3 gen3d.py balance                                       # credits left (free)
 ```
 
+Tests (a local fake of the V3 API; spends nothing): `python3 -m unittest discover -s tests`
+
 Add `--json` to any subcommand for one machine-readable result object on
 stdout (progress moves to stderr) — handy when an agent or script is parsing.
 
 ## Safety
 
-Paid subcommands print the cost and current balance, then ask for
+`rig` and `animate` print the cost and current balance, then ask for
 confirmation. Non-interactive runs **refuse to spend** unless `--yes` is
-passed — the contract for agents is in [AGENTS.md](AGENTS.md): never `--yes`
-without explicit human approval of that specific spend.
+passed. `generate` prints its cost but **does not ask**, so the approval has to
+happen before you run it. The contract for agents is in [AGENTS.md](AGENTS.md):
+no paid run and no `--yes` without explicit human approval of that specific
+spend.
 
 ## Workflow (the part the agent automates)
 
